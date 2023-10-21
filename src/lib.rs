@@ -95,15 +95,40 @@ struct ListDecoder;
 
 impl Decoder for ListDecoder {
     fn try_decode(&self, mut input: BencodedDecodeInput) -> Option<(serde_json::Value, BencodedDecodeInput)> {
-        let start_ch = input.iter_mut().next()?;
-        (start_ch == 'l').then_some(())?;
-        let result_iter = input
-            .decode_iter_mut();
+        input
+            .iter_mut()
+            .next()
+            .filter(|ch| *ch == 'l')?;
 
-        let results: Vec<_> = result_iter
+        let result: Vec<_> = input
+            .decode_list_iter_mut()
             .collect();
 
-        Some((serde_json::Value::Array(results.into()), input))
+        input.iter_mut().next().filter(|ch| *ch == 'e')?;
+
+        Some((serde_json::Value::Array(result.into()), input))
+    }
+}
+
+struct DictDecoder;
+
+impl Decoder for DictDecoder {
+    fn try_decode(&self, mut input: BencodedDecodeInput) -> Option<(serde_json::Value, BencodedDecodeInput)> {
+        input
+            .iter_mut()
+            .next()
+            .filter(|ch| *ch == 'd')?;
+
+        let result: serde_json::Map<_, _> = input
+            .decode_dict_iter_mut()
+            .collect();
+
+        input
+            .iter_mut()
+            .next()
+            .filter(|ch| *ch == 'e')?;
+
+        Some((serde_json::Value::Object(result.into()), input))
     }
 }
 
@@ -163,7 +188,11 @@ impl Iterator for BencodedDecodeInputIter {
     }
 }
 
-struct BencodedDecodeIterMut<'a> {
+struct BencodedDecodeListIterMut<'a> {
+    input: &'a mut BencodedDecodeInput
+}
+
+struct BencodedDecodeDictIterMut<'a> {
     input: &'a mut BencodedDecodeInput
 }
 
@@ -185,16 +214,21 @@ impl BencodedDecodeInput {
             Some('0'..='9') => Box::new(StringDecoder),
             Some('i') => Box::new(IntegerDecoder),
             Some('l') => Box::new(ListDecoder),
+            Some('d') => Box::new(DictDecoder),
             _ => Box::new(FailureDecoder)
         }
     }
 
-    fn decode_iter_mut(&mut self) -> BencodedDecodeIterMut {
-        BencodedDecodeIterMut { input: self }
+    fn decode_list_iter_mut(&mut self) -> BencodedDecodeListIterMut {
+        BencodedDecodeListIterMut { input: self }
+    }
+
+    fn decode_dict_iter_mut(&mut self) -> BencodedDecodeDictIterMut {
+        BencodedDecodeDictIterMut { input: self }
     }
 }
 
-impl<'a> Iterator for BencodedDecodeIterMut<'a> {
+impl<'a> Iterator for BencodedDecodeListIterMut<'a> {
     type Item = serde_json::Value;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -202,6 +236,24 @@ impl<'a> Iterator for BencodedDecodeIterMut<'a> {
         let (decoded_value, rest) = decoder.run_decoder(self.input.clone());
         self.input.index = rest.index;
         decoded_value
+    }
+}
+
+impl<'a> Iterator for BencodedDecodeDictIterMut<'a> {
+    type Item = (String, serde_json::Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key, rest) = StringDecoder.run_decoder(self.input.clone());
+        self.input.index = rest.index;
+        let key = match key {
+            Some(serde_json::Value::String(key)) => key,
+            _ => None?
+        };
+
+        let decoder = self.input.next_decoder();
+        let (decoded_value, rest) = decoder.run_decoder(self.input.clone());
+        self.input.index = rest.index;
+        Some((key, decoded_value?))
     }
 }
 
@@ -221,16 +273,70 @@ fn decode_bencoded_value(encoded_value: String) -> serde_json::Value {
     }
 }
 
-// Usage: your_bittorrent.sh decode "<encoded_value>"
-fn main() {
-    let mut args = env::args().skip(1);
-    let command = args.next().unwrap();
+#[cfg(test)]
+mod test {
+    use crate::decode_bencoded_value;
 
-    if command == "decode" {
-        let encoded_value = args.next().unwrap();
-        let decoded_value = decode_bencoded_value(encoded_value);
-        println!("{}", decoded_value.to_string());
-    } else {
-        println!("unknown command: {}", command)
+    #[test]
+    fn test_string() {
+        assert_eq!(
+            decode_bencoded_value("4:spam".into()),
+            serde_json::json!("spam")
+        );
+        assert_eq!(
+            decode_bencoded_value("0:".into()),
+            serde_json::json!("")
+        );
+    }
+
+    #[test]
+    fn test_integer() {
+        assert_eq!(
+            decode_bencoded_value("i3e".into()),
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            decode_bencoded_value("i-3e".into()),
+            serde_json::json!(-3)
+        );
+    }
+
+    #[test]
+    fn test_list() {
+        assert_eq!(
+            decode_bencoded_value("l4:spam4:eggse".into()),
+            serde_json::json!(["spam", "eggs"])
+        );
+        assert_eq!(
+            decode_bencoded_value("le".into()),
+            serde_json::json!([])
+        );
+        assert_eq!(
+            decode_bencoded_value("li32elei2e1:se".into()),
+            serde_json::json!([32, [], 2, "s"])
+        );
+    }
+
+    #[test]
+    fn test_dict() {
+        assert_eq!(
+            decode_bencoded_value("d3:cow3:moo4:spam4:eggse".into()),
+            serde_json::json!({
+                "cow": "moo",
+                "spam": "eggs"
+            })
+        );
+        assert_eq!(
+            decode_bencoded_value("d4:spaml1:a1:bee".into()),
+            serde_json::json!({"spam": ["a","b"]})
+        );
+        assert_eq!(
+            decode_bencoded_value("d9:publisher3:bob17:publisher-webpage15:www.example.com18:publisher.location4:homee".into()),
+            serde_json::json!({"publisher": "bob", "publisher-webpage": "www.example.com", "publisher.location": "home"})
+        );
+        assert_eq!(
+            decode_bencoded_value("de".into()),
+            serde_json::json!({})
+        );
     }
 }
